@@ -37,12 +37,12 @@ Responses stream directly into the terminal as text arrives. Tool arguments are 
 ## What happens
 
 1. Each user message, assistant response, tool call, and tool result is written to `history.md` in a private session directory under `memory/<session-id>/` beside `nanocode.py`.
-2. Before each agent request, the working conversation size is estimated. At the threshold, a separate model request creates a short checkpoint with decisions, constraints, progress, outstanding work, and search terms.
-3. The checkpoint replaces older working messages in `state.json`. The most recent user turn is retained when it fits. A large ongoing turn is summarized only after tool results are collected, preserving tool call/result pairing.
-4. The agent uses the checkpoint first. For missing specifics, `history_search` performs case-insensitive literal grep across the entire transcript and returns line numbers. `history_read` retrieves surrounding lines. Both tools paginate, including character offsets for very long lines.
+2. Before each agent request, the working conversation size is estimated. At the threshold, a separate model request classifies older messages for durable value.
+3. Classified low-value memories are removed from `state.json`; durable messages and the most recent user turn stay verbatim. Tool calls and their results are kept together. The full original transcript remains searchable in `history.md`.
+4. The agent uses the classified memory first. For missing specifics, `history_search` performs case-insensitive literal grep across the entire transcript and returns line numbers. `history_read` retrieves surrounding lines. Both tools paginate, including character offsets for very long lines.
 5. Resuming restores the compacted working state while keeping the full transcript available. Interrupted tool calls receive an “execution status unknown” result so mutations are not automatically replayed.
 
-The transcript is append-only during normal agent operation: compaction never rewrites or deletes it. It includes compaction checkpoints and system prompts, but cannot contain provider-internal reasoning or information the API never returned. It is an ordinary editable file, not a tamper-proof audit log. History is session-scoped.
+The transcript is append-only during normal agent operation: compaction never rewrites or deletes it. Classification only prunes the working memory in `state.json`; it does not delete the durable `history.md` record. It includes compaction checkpoints and system prompts, but cannot contain provider-internal reasoning or information the API never returned. It is an ordinary editable file, not a tamper-proof audit log. History is session-scoped.
 
 `memory.py` contains storage, compaction, and retrieval. `nanocode.py` contains the original coding agent and the integration. There is no vector database, embedding index, or retrieval service.
 
@@ -52,8 +52,8 @@ The transcript is append-only during normal agent operation: compaction never re
 python3 -m unittest -v
 ```
 
-Fourteen offline regression tests cover compaction and exact-detail recovery, repeated compaction and resume, tool boundaries, failed compaction, pagination, interrupted calls, and a scripted agent loop that searches for a fact omitted from its checkpoint. The API is mocked in these tests; they do not demonstrate live model retrieval quality.
+Offline regression tests cover classification-based compaction and exact-detail recovery, repeated compaction and resume, tool boundaries, failed compaction, pagination, interrupted calls, malformed classifier responses, and a scripted agent loop that searches for a fact omitted from working memory. The API is mocked in these tests; they do not demonstrate live model classification quality.
 
-The default threshold estimates message tokens as serialized UTF-8 bytes divided by three. It is not a tokenizer or a hard context guarantee; allow room for system/tools, response tokens, and the summarization request. A single huge tool output can still exceed a provider's context window. Failed or oversized summaries retain the original working context and surface an error.
+The default threshold estimates message tokens as serialized UTF-8 bytes divided by three. It is not a tokenizer or a hard context guarantee; allow room for system/tools, response tokens, and the classification request. A single huge tool output can still exceed a provider's context window. Failed or oversized classifications retain the original working context and surface an error.
 
 Use one process per session directory. Working state is saved with atomic replacement; a crash between appending the transcript and saving state can leave extra transcript entries not present in resumed working state. Like upstream nanocode, this executes shell commands and edits files with your user's permissions. Session logs contain the prompts and tool outputs you give it; keep them private.

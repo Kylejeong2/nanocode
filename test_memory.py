@@ -54,6 +54,36 @@ class MemoryTests(unittest.TestCase):
             m.compact(lambda _: (_ for _ in ()).throw(RuntimeError("API failed")), force=True)
         self.assertEqual(m.messages, original)
 
+    def test_classified_compaction_drops_low_value_memory_and_keeps_tail(self):
+        m = self.memory
+        m.append("user", "Durable constraint: never edit generated files.\n" + "context " * 600)
+        m.append("assistant", [{"type": "text", "text": "Transient progress update."}])
+        m.append("user", "What should we do next?")
+        self.assertTrue(m.compact(
+            lambda _: "unused",
+            classify=lambda records: [0],
+            force=True,
+        ))
+        contents = str(m.messages)
+        self.assertIn("never edit generated files", contents)
+        self.assertNotIn("Transient progress update", contents)
+        self.assertIn("What should we do next?", contents)
+        self.assertIn("Classified memory: kept", m.transcript.read_text())
+
+    def test_classified_compaction_keeps_tool_call_and_result_together(self):
+        m = self.memory
+        m.append("user", "Investigate the failure")
+        m.append("assistant", [{"type": "tool_use", "id": "t1", "name": "read", "input": {"path": "x"}}])
+        m.append("user", [{"type": "tool_result", "tool_use_id": "t1", "content": "important output"}])
+        m.append("user", "Continue")
+        self.assertTrue(m.compact(
+            lambda _: "unused",
+            classify=lambda records: [2],
+            force=True,
+        ))
+        self.assertIn("'id': 't1'", str(m.messages))
+        self.assertIn("important output", str(m.messages))
+
     def test_search_pagination_and_long_line_read(self):
         m = self.memory
         m.append("user", "\n".join(["needle"] * 60) + "\n" + "A" * 15000 + "TAIL")
@@ -153,11 +183,25 @@ class MemoryTests(unittest.TestCase):
                 self.assertIsNone(request.get_header("X-api-key"))
                 self.assertEqual("tools" in json.loads(request.data), not summary)
 
+    def test_classify_memory_parses_json_response(self):
+        with patch.object(nanocode, "call_api", return_value={
+            "content": [{"type": "text", "text": "```json\n{\"keep\":[0, 2]}\n```"}]
+        }) as call:
+            self.assertEqual(nanocode.classify_memory([{"index": 0}, {"index": 1}]), [0, 2])
+            self.assertTrue(call.call_args.args[1].startswith("Classify historical"))
+
+    def test_classify_memory_rejects_malformed_response(self):
+        with patch.object(nanocode, "call_api", return_value={
+            "content": [{"type": "text", "text": "not json"}]
+        }):
+            with self.assertRaisesRegex(ValueError, "invalid JSON"):
+                nanocode.classify_memory([])
+
     def test_cli_compacts_then_retrieves_via_agent_tool_loop(self):
         session = str(Path(self.temp.name) / "cli")
         responses = iter([
             {"content": [{"type": "text", "text": "Recorded."}]},
-            {"content": [{"type": "text", "text": "User gave a release code. Search history for it."}]},
+            {"content": [{"type": "text", "text": "{\"keep\":[]}"}]},
             {"content": [{"type": "tool_use", "id": "s", "name": "history_search", "input": {"query": "ORCHID"}}]},
             {"content": [{"type": "text", "text": "The code was ORCHID-729."}]},
         ])

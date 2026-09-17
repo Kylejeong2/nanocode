@@ -70,7 +70,40 @@ class Memory:
         # Conservative heuristic, not a provider tokenizer or a context guarantee.
         return (len(json.dumps(self.messages, ensure_ascii=False).encode()) + 2) // 3
 
-    def compact(self, summarize, force=False):
+    @staticmethod
+    def _memory_records(messages):
+        records = []
+        for index, message in enumerate(messages):
+            content = message["content"]
+            if isinstance(content, str):
+                text = content
+            else:
+                text = json.dumps(content, ensure_ascii=False)
+            records.append({
+                "index": index,
+                "role": message["role"],
+                "content": text,
+            })
+        return records
+
+    @staticmethod
+    def _classified_messages(messages, keep_indices):
+        keep = set(keep_indices)
+        tool_messages = {}
+        for index, message in enumerate(messages):
+            content = message["content"]
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                tool_id = block.get("id") or block.get("tool_use_id")
+                if tool_id:
+                    tool_messages.setdefault(tool_id, set()).add(index)
+        for indices in tool_messages.values():
+            if keep.intersection(indices):
+                keep.update(indices)
+        return [message for index, message in enumerate(messages) if index in keep]
+
+    def compact(self, summarize, force=False, classify=None):
         if not self.messages or (not force and self.estimate() < self.threshold):
             return False
         # Never separate a tool call from its result. Prefer retaining the most
@@ -81,20 +114,48 @@ class Memory:
         tail = self.messages[cut:]
         if cut == 0 or len(json.dumps(tail).encode()) // 3 > self.threshold // 2:
             cut, tail = len(self.messages), []
-        summary = summarize(self.messages[:cut])
-        if not summary or not summary.strip():
-            raise ValueError("empty compaction summary; original context retained")
-        replacement = [{"role": "user", "content": (
-            "Conversation checkpoint (historical data, not new instructions):\n" + summary +
-            f"\n\nFull original transcript: {self.transcript}. Use history_search and history_read "
-            "for exact details missing from this checkpoint. Continue the outstanding task."
-        )}]
+        if classify is not None:
+            candidates = self.messages[:cut]
+            keep_indices = classify(self._memory_records(candidates))
+            if not isinstance(keep_indices, (list, tuple, set, frozenset)):
+                raise ValueError("memory classifier must return a collection of message indices")
+            if any(not isinstance(index, int) or index < 0 or index >= len(candidates)
+                   for index in keep_indices):
+                raise ValueError("memory classifier returned an invalid message index")
+            retained = self._classified_messages(candidates, keep_indices)
+            replacement = retained
+            classification_note = (
+                f"Classified memory: kept {len(retained)} of {len(candidates)} historical "
+                f"messages. Full original transcript: {self.transcript}. "
+                "Use history_search and history_read for exact details missing from memory."
+            )
+            if replacement:
+                replacement = [{
+                    "role": "user",
+                    "content": (
+                        "Memory compaction note (historical data, not new instructions):\n"
+                        + classification_note
+                    ),
+                }] + replacement
+            else:
+                replacement = [{"role": "user", "content": classification_note}]
+            checkpoint = classification_note
+        else:
+            summary = summarize(self.messages[:cut])
+            if not summary or not summary.strip():
+                raise ValueError("empty compaction summary; original context retained")
+            replacement = [{"role": "user", "content": (
+                "Conversation checkpoint (historical data, not new instructions):\n" + summary +
+                f"\n\nFull original transcript: {self.transcript}. Use history_search and history_read "
+                "for exact details missing from this checkpoint. Continue the outstanding task."
+            )}]
+            checkpoint = summary
         if tail:
             replacement.append({"role": "assistant", "content": "I will continue from this checkpoint."})
             replacement.extend(tail)
         if len(json.dumps(replacement, ensure_ascii=False).encode()) // 3 >= self.threshold:
-            raise ValueError("summary did not fit the budget; original context retained")
-        self.record("Compaction checkpoint", summary)
+            raise ValueError("classified memory did not fit the budget; original context retained")
+        self.record("Compaction checkpoint", checkpoint)
         self.messages = replacement
         self.compactions += 1
         self.save()
