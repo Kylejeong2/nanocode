@@ -7,7 +7,7 @@ from pathlib import Path
 
 
 class Memory:
-    def __init__(self, directory, system, threshold=24000):
+    def __init__(self, directory, system, threshold=2400):
         self.directory = Path(directory).resolve()
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.transcript = self.directory / "history.md"

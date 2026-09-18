@@ -26,11 +26,13 @@ python3 nanocode.py
 Set `MODEL` to an OpenRouter model ID available to your account (default: `anthropic/claude-opus-4.5`). `OPENROUTER_API_KEY` is required for agent requests. `TYPESAFE_API_KEY` optionally enables Jev memory classification; without it, compaction falls back to the OpenRouter summary path. `JEV_MODEL` is optional and defaults to `jev-latest`.
 
 ```sh
-python3 nanocode.py --compact-at 24000
+python3 nanocode.py --compact-at 2400
 python3 nanocode.py --session "memory/<session-id>"
 ```
 
 Each session ID combines a timestamp and a random suffix. Its folder contains `history.md` and, after the first message, `state.json`. The `memory/` folder is ignored by Git. Existing sessions in `~/.nanocode/sessions/` can still be resumed by passing their full path to `--session`.
+
+When `TYPESAFE_API_KEY` is set, two Jev tools are registered alongside the coding tools. `jev_ask` scores statements about text the agent supplies (`context`, optional `goal`, and `questions` as one statement per line, max 20) and returns a probability between 0 and 1 for each, in order; Jev never sees the conversation, so the agent must pass in whatever it wants judged. `jev_compact` lets the agent compact its own working context; the request is deferred until the pending tool results are recorded, so a tool call is never separated from its result.
 
 Commands: `/compact` forces a checkpoint, `/history` prints the transcript path, `/c` starts a fresh session without deleting the old one, `/q` exits.
 
