@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 from memory import Memory
 import nanocode
+import jev
 
 
 class MemoryTests(unittest.TestCase):
@@ -54,6 +55,54 @@ class MemoryTests(unittest.TestCase):
             m.compact(lambda _: (_ for _ in ()).throw(RuntimeError("API failed")), force=True)
         self.assertEqual(m.messages, original)
 
+    def test_jev_compaction_drops_low_value_memory_and_keeps_tail(self):
+        m = self.memory
+        m.append("user", "Durable constraint: never edit generated files.\n" + "context " * 600)
+        m.append("assistant", [{"type": "text", "text": "Transient progress update."}])
+        m.append("user", "What should we do next?")
+        def prune(messages, preserve_recent):
+            self.assertEqual(preserve_recent, 0)
+            return {"messages": [messages[0]], "stats": {
+                "callsDropped": 0, "resultsDropped": 0,
+            }}
+        self.assertTrue(m.compact(lambda _: "unused", prune=prune, force=True))
+        contents = str(m.messages)
+        self.assertIn("never edit generated files", contents)
+        self.assertNotIn("Transient progress update", contents)
+        self.assertIn("What should we do next?", contents)
+        self.assertIn("Jev compaction: kept", m.transcript.read_text())
+
+    def test_jev_compaction_keeps_tool_call_and_result_together(self):
+        m = self.memory
+        m.append("user", "Investigate the failure")
+        m.append("assistant", [{"type": "tool_use", "id": "t1", "name": "read", "input": {"path": "x"}}])
+        m.append("user", [{"type": "tool_result", "tool_use_id": "t1", "content": "important output"}])
+        m.append("user", "Continue")
+        def prune(messages, preserve_recent):
+            return {"messages": [messages[0], messages[1], messages[2]], "stats": {}}
+        self.assertTrue(m.compact(lambda _: "unused", prune=prune, force=True))
+        self.assertIn("'id': 't1'", str(m.messages))
+        self.assertIn("important output", str(m.messages))
+
+    def test_jev_compaction_prunes_history(self):
+        m = self.memory
+        m.append("user", "Investigate the failure")
+        m.append("assistant", [{"type": "tool_use", "id": "t1", "name": "read", "input": {"path": "x"}}])
+        m.append("user", [{"type": "tool_result", "tool_use_id": "t1", "content": "important output"}])
+        m.append("user", "Continue")
+
+        def prune(messages, preserve_recent):
+            return {
+                "messages": [messages[0]],
+                "decisions": [{"tool_use_id": "t1", "action": "drop_call"}],
+                "stats": {"callsDropped": 1, "resultsDropped": 0},
+            }
+
+        self.assertTrue(m.compact(lambda _: "unused", prune=prune, force=True))
+        self.assertNotIn("important output", m.transcript.read_text())
+        self.assertIn("Compaction checkpoint", m.transcript.read_text())
+        self.assertIn("important output", m.full.read_text())
+
     def test_search_pagination_and_long_line_read(self):
         m = self.memory
         m.append("user", "\n".join(["needle"] * 60) + "\n" + "A" * 15000 + "TAIL")
@@ -69,6 +118,35 @@ class MemoryTests(unittest.TestCase):
         resumed = Memory(self.temp.name, "system", 2000)
         self.assertEqual(resumed.messages[-1]["content"][0]["tool_use_id"], "t1")
         self.assertIn("unknown", resumed.messages[-1]["content"][0]["content"])
+
+    def test_prune_transcript_removes_dropped_calls_and_truncates_results(self):
+        m = self.memory
+        m.append("user", "Keep this user text")
+        m.append("assistant", [
+            {"type": "tool_use", "id": "a", "name": "read", "input": {"path": "a"}},
+            {"type": "tool_use", "id": "b", "name": "read", "input": {"path": "b"}},
+        ])
+        m.append("user", [
+            {"type": "tool_result", "tool_use_id": "a", "content": "A" * 1000},
+            {"type": "tool_result", "tool_use_id": "b", "content": "B" * 1000},
+        ])
+        m.append("assistant", [{"type": "text", "text": "Still here"}])
+        m.prune_transcript([
+            {"tool_use_id": "a", "action": "drop_call"},
+            {"tool_use_id": "b", "action": "drop_result"},
+        ], head_chars=10)
+        history = m.transcript.read_text()
+        full = m.full.read_text()
+        self.assertNotIn('"id": "a"', history)
+        self.assertNotIn("Tool call: a", history)
+        self.assertNotIn("A" * 1000, history)
+        self.assertIn("Tool call: b", history)
+        self.assertIn("B" * 10, history)
+        self.assertIn("truncated", history)
+        self.assertNotIn("B" * 1000, history)
+        self.assertIn("Keep this user text", history)
+        self.assertIn("A" * 1000, full)
+        self.assertIn("B" * 1000, full)
 
     def test_dotenv_loads_quotes_comments_and_literal_values(self):
         path = Path(self.temp.name) / ".env"
@@ -153,11 +231,132 @@ class MemoryTests(unittest.TestCase):
                 self.assertIsNone(request.get_header("X-api-key"))
                 self.assertEqual("tools" in json.loads(request.data), not summary)
 
+    def test_jev_client_request_and_validation(self):
+        class Response:
+            status = 200
+            def read(self):
+                return b'{"answers":{"call_t1":{"noul":0.8}}}'
+            def close(self):
+                pass
+        requests = []
+        def opener(request):
+            requests.append(request)
+            return Response()
+        client = jev.JevClient("jev-key", "jev-test", "https://jev.test", opener)
+        self.assertEqual(client.ask({"history": []}, {"call_t1": {"type": "noul"}})["answers"]["call_t1"]["noul"], 0.8)
+        self.assertEqual(requests[0].full_url, "https://jev.test")
+        self.assertEqual(requests[0].get_header("Authorization"), "Bearer jev-key")
+        self.assertEqual(json.loads(requests[0].data)["model"], "jev-test")
+        self.assertEqual(jev.noul_answer({"x": {"noul": 0.5}}, "x"), 0.5)
+        with self.assertRaises(ValueError):
+            jev.noul_answer({}, "x")
+
+    def test_jev_client_rejects_http_malformed_and_missing_answers(self):
+        class Response:
+            def __init__(self, status, body):
+                self.status, self.body = status, body
+            def read(self):
+                return self.body
+            def close(self):
+                pass
+        for response, message in (
+            (Response(500, b"provider exploded" * 20), r"Jev request failed \(500\)"),
+            (Response(200, b"not json"), "malformed JSON"),
+            (Response(200, b"{}"), "missing answers"),
+        ):
+            with self.subTest(message=message):
+                client = jev.JevClient("key", opener=lambda _request, response=response: response)
+                with self.assertRaisesRegex(ValueError, message):
+                    client.ask({}, {})
+
+    def test_fit_state_shrinks_and_rejects_impossible_history(self):
+        messages = [
+            {"role": "user", "content": "old " * 2000},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "a", "name": "read", "input": {"path": "x" * 2000}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "a", "content": "result"}]},
+            {"role": "user", "content": "recent"},
+        ]
+        calls = jev.collect_tool_calls(messages, 0)
+        state, tokens, stage = jev.fit_state(messages, calls, max_state_tokens=1000, preserve_recent=0)
+        self.assertLessEqual(tokens, 1000)
+        self.assertTrue(stage)
+        with self.assertRaisesRegex(ValueError, "history too large for Jev"):
+            jev.fit_state(messages, calls, max_state_tokens=1, preserve_recent=0)
+
+    def test_jev_compact_applies_keep_drop_result_and_drop_call(self):
+        messages = [
+            {"role": "user", "content": "request"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "a", "name": "read", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "a", "content": "A" * 500}]},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "b", "name": "read", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "b", "content": "B" * 500}]},
+        ]
+        class Asker:
+            def ask(self, state, questions):
+                answers = {}
+                for name in questions:
+                    answers[name] = {"noul": 0.8 if name == "call_t1" else 0.2}
+                return {"answers": answers}
+        result = jev.compact(messages, Asker(), preserve_recent=0, truncate_head_chars=10)
+        self.assertEqual(result["stats"]["calls"], 2)
+        self.assertIn("truncated", result["messages"][2]["content"][0]["content"])
+        self.assertEqual(len(result["messages"]), 3)
+
+    def test_jev_prune_pins_newest_tool_pair(self):
+        messages = [
+            {"role": "user", "content": "request"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "a", "name": "read", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "a", "content": "A" * 500}]},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "b", "name": "read", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "b", "content": "B" * 500}]},
+        ]
+        class Asker:
+            def ask(self, state, questions):
+                return {"answers": {name: {"noul": 0.0} for name in questions}}
+        with patch.object(nanocode.jev, "JevClient", return_value=Asker()), \
+                patch.object(nanocode, "TYPESAFE_KEY", "k"):
+            result = nanocode.jev_prune(messages, 2)
+        self.assertEqual(result["stats"]["pinned"], 1)
+        self.assertEqual(result["stats"]["callsDropped"], 1)
+        self.assertEqual(result["decisions"][0]["tool_use_id"], "a")
+        self.assertEqual(result["messages"][-1]["content"][0]["content"], "B" * 500)
+
+    def test_best_effort_compaction_applies_shrink_and_skips_no_op_until_growth(self):
+        m = self.memory
+        m.append("user", "task")
+        m.append("assistant", [{"type": "tool_use", "id": "t1", "name": "read", "input": {}}])
+        m.append("user", [{"type": "tool_result", "tool_use_id": "t1", "content": "R" * 9000}])
+        stats = {"callsDropped": 0, "resultsDropped": 0}
+        shrink = lambda msgs, recent: {"messages": [msgs[0], msgs[1], {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "R" * 8000}]}], "stats": stats}
+        self.assertTrue(m.compact(lambda _: "", prune=shrink))
+        self.assertGreaterEqual(m.estimate(), m.threshold)
+        calls = []
+        def noop(msgs, recent):
+            calls.append(recent)
+            return {"messages": list(msgs), "stats": stats}
+        self.assertFalse(m.compact(lambda _: "", prune=noop))
+        self.assertFalse(m.compact(lambda _: "", prune=noop))
+        self.assertEqual(len(calls), 0)
+        m.append("assistant", [{"type": "text", "text": "more"}])
+        self.assertFalse(m.compact(lambda _: "", prune=noop))
+        self.assertEqual(calls, [2])
+        with self.assertRaises(ValueError):
+            m.compact(lambda _: "", prune=noop, force=True)
+
+    def test_prune_malformed_shape_leaves_state_untouched(self):
+        original = list(self.memory.messages)
+        self.memory.append("user", "new")
+        original = list(self.memory.messages)
+        with self.assertRaises(ValueError):
+            self.memory.compact(lambda _: "unused", prune=lambda _, __: [], force=True)
+        self.assertEqual(self.memory.messages, original)
+
     def test_cli_compacts_then_retrieves_via_agent_tool_loop(self):
         session = str(Path(self.temp.name) / "cli")
         responses = iter([
             {"content": [{"type": "text", "text": "Recorded."}]},
-            {"content": [{"type": "text", "text": "User gave a release code. Search history for it."}]},
+            {"content": [{"type": "text", "text": "Checkpoint."}]},
             {"content": [{"type": "tool_use", "id": "s", "name": "history_search", "input": {"query": "ORCHID"}}]},
             {"content": [{"type": "text", "text": "The code was ORCHID-729."}]},
         ])
@@ -165,7 +364,7 @@ class MemoryTests(unittest.TestCase):
         def api(messages, system, summary=False, on_text=None):
             calls.append((str(messages), summary))
             return next(responses)
-        with patch("sys.argv", ["nanocode.py", "--session", session]), patch("builtins.input", side_effect=["Code: ORCHID-729", "/compact", "What was the code?", "/q"]), patch.object(nanocode, "call_api", side_effect=api), patch("builtins.print"):
+        with patch("sys.argv", ["nanocode.py", "--session", session]), patch("builtins.input", side_effect=["Code: ORCHID-729", "/compact", "What was the code?", "/q"]), patch.object(nanocode, "call_api", side_effect=api), patch.object(nanocode, "TYPESAFE_KEY", None), patch("builtins.print"):
             nanocode.main()
         self.assertTrue(calls[1][1])
         self.assertNotIn("ORCHID-729", calls[2][0])
