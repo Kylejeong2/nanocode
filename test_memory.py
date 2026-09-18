@@ -60,7 +60,8 @@ class MemoryTests(unittest.TestCase):
         m.append("user", "Durable constraint: never edit generated files.\n" + "context " * 600)
         m.append("assistant", [{"type": "text", "text": "Transient progress update."}])
         m.append("user", "What should we do next?")
-        def prune(messages):
+        def prune(messages, preserve_recent):
+            self.assertEqual(preserve_recent, 0)
             return {"messages": [messages[0]], "stats": {
                 "callsDropped": 0, "resultsDropped": 0,
             }}
@@ -77,7 +78,7 @@ class MemoryTests(unittest.TestCase):
         m.append("assistant", [{"type": "tool_use", "id": "t1", "name": "read", "input": {"path": "x"}}])
         m.append("user", [{"type": "tool_result", "tool_use_id": "t1", "content": "important output"}])
         m.append("user", "Continue")
-        def prune(messages):
+        def prune(messages, preserve_recent):
             return {"messages": [messages[0], messages[1], messages[2]], "stats": {}}
         self.assertTrue(m.compact(lambda _: "unused", prune=prune, force=True))
         self.assertIn("'id': 't1'", str(m.messages))
@@ -253,12 +254,53 @@ class MemoryTests(unittest.TestCase):
         self.assertIn("truncated", result["messages"][2]["content"][0]["content"])
         self.assertEqual(len(result["messages"]), 3)
 
+    def test_jev_prune_pins_newest_tool_pair(self):
+        messages = [
+            {"role": "user", "content": "request"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "a", "name": "read", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "a", "content": "A" * 500}]},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "b", "name": "read", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "b", "content": "B" * 500}]},
+        ]
+        class Asker:
+            def ask(self, state, questions):
+                return {"answers": {name: {"noul": 0.0} for name in questions}}
+        with patch.object(nanocode.jev, "JevClient", return_value=Asker()), \
+                patch.object(nanocode, "TYPESAFE_KEY", "k"):
+            result = nanocode.jev_prune(messages, 2)
+        self.assertEqual(result["stats"]["pinned"], 1)
+        self.assertEqual(result["stats"]["callsDropped"], 1)
+        self.assertEqual(result["messages"][-1]["content"][0]["content"], "B" * 500)
+
+    def test_best_effort_compaction_applies_shrink_and_skips_no_op_until_growth(self):
+        m = self.memory
+        m.append("user", "task")
+        m.append("assistant", [{"type": "tool_use", "id": "t1", "name": "read", "input": {}}])
+        m.append("user", [{"type": "tool_result", "tool_use_id": "t1", "content": "R" * 9000}])
+        stats = {"callsDropped": 0, "resultsDropped": 0}
+        shrink = lambda msgs, recent: {"messages": [msgs[0], msgs[1], {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "R" * 8000}]}], "stats": stats}
+        self.assertTrue(m.compact(lambda _: "", prune=shrink))
+        self.assertGreaterEqual(m.estimate(), m.threshold)
+        calls = []
+        def noop(msgs, recent):
+            calls.append(recent)
+            return {"messages": list(msgs), "stats": stats}
+        self.assertFalse(m.compact(lambda _: "", prune=noop))
+        self.assertFalse(m.compact(lambda _: "", prune=noop))
+        self.assertEqual(len(calls), 0)
+        m.append("assistant", [{"type": "text", "text": "more"}])
+        self.assertFalse(m.compact(lambda _: "", prune=noop))
+        self.assertEqual(calls, [2])
+        with self.assertRaises(ValueError):
+            m.compact(lambda _: "", prune=noop, force=True)
+
     def test_prune_malformed_shape_leaves_state_untouched(self):
         original = list(self.memory.messages)
         self.memory.append("user", "new")
         original = list(self.memory.messages)
         with self.assertRaises(ValueError):
-            self.memory.compact(lambda _: "unused", prune=lambda _: [], force=True)
+            self.memory.compact(lambda _: "unused", prune=lambda _, __: [], force=True)
         self.assertEqual(self.memory.messages, original)
 
     def test_cli_compacts_then_retrieves_via_agent_tool_loop(self):

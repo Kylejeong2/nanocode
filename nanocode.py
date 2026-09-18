@@ -303,11 +303,11 @@ def call_api(messages, system_prompt, summary=False, on_text=None):
         response.close()
 
 
-def jev_prune(messages):
+def jev_prune(messages, preserve_recent):
     return jev.compact(
         messages,
         jev.JevClient(TYPESAFE_KEY, JEV_MODEL),
-        preserve_recent=0,
+        preserve_recent=preserve_recent,
     )
 
 

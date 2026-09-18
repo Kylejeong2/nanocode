@@ -17,6 +17,8 @@ class Memory:
             raise ValueError("compaction threshold must be at least 1000")
         self.messages = []
         self.compactions = 0
+        # Size after the last compaction; nothing new to compact until it grows.
+        self.compacted_size = 0
         if self.state.exists():
             data = json.loads(self.state.read_text())
             self.messages = data["messages"]
@@ -71,7 +73,8 @@ class Memory:
         return (len(json.dumps(self.messages, ensure_ascii=False).encode()) + 2) // 3
 
     def compact(self, summarize, force=False, prune=None):
-        if not self.messages or (not force and self.estimate() < self.threshold):
+        size = self.estimate()
+        if not self.messages or (not force and (size < self.threshold or size <= self.compacted_size)):
             return False
         # Never separate a tool call from its result. Prefer retaining the most
         # recent complete user turn; compact all at a tool boundary if it is huge.
@@ -83,7 +86,9 @@ class Memory:
             cut, tail = len(self.messages), []
         if prune is not None:
             candidates = self.messages[:cut]
-            result = prune(candidates)
+            # Without a tail the in-flight turn is being compacted, so the newest
+            # tool call/result pair must survive or the agent re-fetches it.
+            result = prune(candidates, 2 if not tail else 0)
             if not isinstance(result, dict) or not isinstance(result.get("messages"), list) \
                     or not isinstance(result.get("stats"), dict):
                 raise ValueError("memory pruner must return a dict with messages and stats")
@@ -117,11 +122,19 @@ class Memory:
         if tail:
             replacement.append({"role": "assistant", "content": "I will continue from this checkpoint."})
             replacement.extend(tail)
-        if len(json.dumps(replacement, ensure_ascii=False).encode()) // 3 >= self.threshold:
-            raise ValueError("classified memory did not fit the budget; original context retained")
+        # A best-effort compaction that still exceeds the budget is applied when it
+        # shrinks the context; one that saves nothing is skipped until the context grows.
+        after = (len(json.dumps(replacement, ensure_ascii=False).encode()) + 2) // 3
+        if after >= size:
+            self.compacted_size = size
+            if not force:
+                return False
+            if after >= self.threshold:
+                raise ValueError("compaction did not shrink the context; original context retained")
         self.record("Compaction checkpoint", checkpoint)
         self.messages = replacement
         self.compactions += 1
+        self.compacted_size = self.estimate()
         self.save()
         return True
 
