@@ -11,6 +11,8 @@ Create a `.env` file beside `nanocode.py`:
 ```dotenv
 OPENROUTER_API_KEY=your-key
 MODEL=anthropic/claude-opus-4.5
+TYPESAFE_API_KEY=your-jev-key
+# JEV_MODEL=jev-latest
 ```
 
 Then run:
@@ -21,7 +23,7 @@ python3 nanocode.py
 
 `.env` loads automatically at startup. Exported environment variables take precedence, followed by the working directory's `.env`, then the `.env` beside the script. Single-line assignments, quoted values, comments, and optional `export` prefixes are supported; shell commands and variable interpolation are not executed. Restart the agent after changing `.env`.
 
-Set `MODEL` to an OpenRouter model ID available to your account (default: `anthropic/claude-opus-4.5`). `OPENROUTER_API_KEY` is required for both agent requests and compaction; there is no direct Anthropic API fallback.
+Set `MODEL` to an OpenRouter model ID available to your account (default: `anthropic/claude-opus-4.5`). `OPENROUTER_API_KEY` is required for agent requests. `TYPESAFE_API_KEY` optionally enables Jev memory classification; without it, compaction falls back to the OpenRouter summary path. `JEV_MODEL` is optional and defaults to `jev-latest`.
 
 ```sh
 python3 nanocode.py --compact-at 24000
@@ -37,12 +39,12 @@ Responses stream directly into the terminal as text arrives. Tool arguments are 
 ## What happens
 
 1. Each user message, assistant response, tool call, and tool result is written to `history.md` in a private session directory under `memory/<session-id>/` beside `nanocode.py`.
-2. Before each agent request, the working conversation size is estimated. At the threshold, a separate model request classifies older messages for durable value.
-3. Classified low-value memories are removed from `state.json`; durable messages and the most recent user turn stay verbatim. Tool calls and their results are kept together. The full original transcript remains searchable in `history.md`.
-4. The agent uses the classified memory first. For missing specifics, `history_search` performs case-insensitive literal grep across the entire transcript and returns line numbers. `history_read` retrieves surrounding lines. Both tools paginate, including character offsets for very long lines.
+2. Before each agent request, the working conversation size is estimated. At the threshold, Jev classifies older tool calls and their results for durable value.
+3. Jev keeps valuable calls and full results, truncates results whose call matters but whose output does not, and drops calls that are not needed. The first message and recent messages are pinned. The full original transcript remains searchable in `history.md`.
+4. The agent uses the compacted memory first. For missing specifics, `history_search` performs case-insensitive literal grep across the entire transcript and returns line numbers. `history_read` retrieves surrounding lines. Both tools paginate, including character offsets for very long lines.
 5. Resuming restores the compacted working state while keeping the full transcript available. Interrupted tool calls receive an “execution status unknown” result so mutations are not automatically replayed.
 
-The transcript is append-only during normal agent operation: compaction never rewrites or deletes it. Classification only prunes the working memory in `state.json`; it does not delete the durable `history.md` record. It includes compaction checkpoints and system prompts, but cannot contain provider-internal reasoning or information the API never returned. It is an ordinary editable file, not a tamper-proof audit log. History is session-scoped.
+The transcript is append-only during normal agent operation: compaction never rewrites or deletes it. Jev pruning only changes the working memory in `state.json`; it does not delete the durable `history.md` record. It includes compaction checkpoints and system prompts, but cannot contain provider-internal reasoning or information the API never returned. It is an ordinary editable file, not a tamper-proof audit log. History is session-scoped.
 
 `memory.py` contains storage, compaction, and retrieval. `nanocode.py` contains the original coding agent and the integration. There is no vector database, embedding index, or retrieval service.
 
@@ -54,6 +56,8 @@ python3 -m unittest -v
 
 Offline regression tests cover classification-based compaction and exact-detail recovery, repeated compaction and resume, tool boundaries, failed compaction, pagination, interrupted calls, malformed classifier responses, and a scripted agent loop that searches for a fact omitted from working memory. The API is mocked in these tests; they do not demonstrate live model classification quality.
 
-The default threshold estimates message tokens as serialized UTF-8 bytes divided by three. It is not a tokenizer or a hard context guarantee; allow room for system/tools, response tokens, and the classification request. A single huge tool output can still exceed a provider's context window. Failed or oversized classifications retain the original working context and surface an error.
+The default threshold estimates message tokens as serialized UTF-8 bytes divided by three. It is not a tokenizer or a hard context guarantee; allow room for system/tools, response tokens, and the classification request. A single huge tool output can still exceed a provider's context window. Failed or oversized compactions retain the original working context and surface an error.
+
+The Jev integration is a Python port of [fast-jev-compaction](https://github.com/typesafe-ai/fast-jev-compaction), released under the MIT license.
 
 Use one process per session directory. Working state is saved with atomic replacement; a crash between appending the transcript and saving state can leave extra transcript entries not present in resumed working state. Like upstream nanocode, this executes shell commands and edits files with your user's permissions. Session logs contain the prompts and tool outputs you give it; keep them private.
