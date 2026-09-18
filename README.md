@@ -46,7 +46,7 @@ Responses stream directly into the terminal as text arrives. Tool arguments are 
 4. The agent uses the compacted memory first. For missing specifics, `history_search` performs case-insensitive literal grep across the entire transcript and returns line numbers. `history_read` retrieves surrounding lines. Both tools paginate, including character offsets for very long lines.
 5. Resuming restores the compacted working state while keeping the full transcript available. Interrupted tool calls receive an “execution status unknown” result so mutations are not automatically replayed.
 
-The transcript is append-only during normal agent operation: compaction never rewrites or deletes it. Jev pruning only changes the working memory in `state.json`; it does not delete the durable `history.md` record. It includes compaction checkpoints and system prompts, but cannot contain provider-internal reasoning or information the API never returned. It is an ordinary editable file, not a tamper-proof audit log. History is session-scoped.
+The transcript backup is append-only during normal agent operation: compaction never rewrites or deletes `history.full.md`. Jev compaction also removes dropped tool calls/results from `history.md` (truncating bulky results), while `history.full.md` keeps the complete unpruned transcript. It includes compaction checkpoints and system prompts, but cannot contain provider-internal reasoning or information the API never returned. It is an ordinary editable file, not a tamper-proof audit log. History is session-scoped.
 
 `memory.py` contains storage, compaction, and retrieval. `nanocode.py` contains the original coding agent and the integration. There is no vector database, embedding index, or retrieval service.
 

@@ -353,7 +353,13 @@ def batch_calls(candidates, state_tokens, max_request_tokens):
 
 
 def decide_call(call, keep_call, keep_result, keep_threshold):
-    result = {"id": call.id, "tool": call.tool, "keep_call": keep_call, "keep_result": keep_result}
+    result = {
+        "id": call.id,
+        "tool_use_id": call.tool_use_id,
+        "tool": call.tool,
+        "keep_call": keep_call,
+        "keep_result": keep_result,
+    }
     if call.pinned:
         result.update(action="keep", reason="pinned")
     elif keep_result >= keep_threshold:

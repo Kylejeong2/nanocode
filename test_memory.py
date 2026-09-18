@@ -84,6 +84,25 @@ class MemoryTests(unittest.TestCase):
         self.assertIn("'id': 't1'", str(m.messages))
         self.assertIn("important output", str(m.messages))
 
+    def test_jev_compaction_prunes_history(self):
+        m = self.memory
+        m.append("user", "Investigate the failure")
+        m.append("assistant", [{"type": "tool_use", "id": "t1", "name": "read", "input": {"path": "x"}}])
+        m.append("user", [{"type": "tool_result", "tool_use_id": "t1", "content": "important output"}])
+        m.append("user", "Continue")
+
+        def prune(messages, preserve_recent):
+            return {
+                "messages": [messages[0]],
+                "decisions": [{"tool_use_id": "t1", "action": "drop_call"}],
+                "stats": {"callsDropped": 1, "resultsDropped": 0},
+            }
+
+        self.assertTrue(m.compact(lambda _: "unused", prune=prune, force=True))
+        self.assertNotIn("important output", m.transcript.read_text())
+        self.assertIn("Compaction checkpoint", m.transcript.read_text())
+        self.assertIn("important output", m.full.read_text())
+
     def test_search_pagination_and_long_line_read(self):
         m = self.memory
         m.append("user", "\n".join(["needle"] * 60) + "\n" + "A" * 15000 + "TAIL")
@@ -99,6 +118,35 @@ class MemoryTests(unittest.TestCase):
         resumed = Memory(self.temp.name, "system", 2000)
         self.assertEqual(resumed.messages[-1]["content"][0]["tool_use_id"], "t1")
         self.assertIn("unknown", resumed.messages[-1]["content"][0]["content"])
+
+    def test_prune_transcript_removes_dropped_calls_and_truncates_results(self):
+        m = self.memory
+        m.append("user", "Keep this user text")
+        m.append("assistant", [
+            {"type": "tool_use", "id": "a", "name": "read", "input": {"path": "a"}},
+            {"type": "tool_use", "id": "b", "name": "read", "input": {"path": "b"}},
+        ])
+        m.append("user", [
+            {"type": "tool_result", "tool_use_id": "a", "content": "A" * 1000},
+            {"type": "tool_result", "tool_use_id": "b", "content": "B" * 1000},
+        ])
+        m.append("assistant", [{"type": "text", "text": "Still here"}])
+        m.prune_transcript([
+            {"tool_use_id": "a", "action": "drop_call"},
+            {"tool_use_id": "b", "action": "drop_result"},
+        ], head_chars=10)
+        history = m.transcript.read_text()
+        full = m.full.read_text()
+        self.assertNotIn('"id": "a"', history)
+        self.assertNotIn("Tool call: a", history)
+        self.assertNotIn("A" * 1000, history)
+        self.assertIn("Tool call: b", history)
+        self.assertIn("B" * 10, history)
+        self.assertIn("truncated", history)
+        self.assertNotIn("B" * 1000, history)
+        self.assertIn("Keep this user text", history)
+        self.assertIn("A" * 1000, full)
+        self.assertIn("B" * 1000, full)
 
     def test_dotenv_loads_quotes_comments_and_literal_values(self):
         path = Path(self.temp.name) / ".env"
@@ -270,6 +318,7 @@ class MemoryTests(unittest.TestCase):
             result = nanocode.jev_prune(messages, 2)
         self.assertEqual(result["stats"]["pinned"], 1)
         self.assertEqual(result["stats"]["callsDropped"], 1)
+        self.assertEqual(result["decisions"][0]["tool_use_id"], "a")
         self.assertEqual(result["messages"][-1]["content"][0]["content"], "B" * 500)
 
     def test_best_effort_compaction_applies_shrink_and_skips_no_op_until_growth(self):
