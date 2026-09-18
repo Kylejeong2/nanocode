@@ -194,8 +194,7 @@ class Memory:
                 f"Jev compaction: kept {len(retained)} of {len(candidates)} messages, "
                 f"dropped {stats.get('callsDropped', 0)} tool calls and "
                 f"truncated {stats.get('resultsDropped', 0)} tool results. "
-                f"Full original transcript: {self.full}. "
-                f"history.md pruned the same way; untouched copy: {self.full}. "
+                f"history.md was pruned the same way; untouched copy: {self.full}. "
                 "Use history_search and history_read for exact details missing from memory."
             )
             replacement = [{
